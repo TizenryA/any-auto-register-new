@@ -716,6 +716,12 @@ class OAuthClient:
             self._set_error(f"触发 passwordless OTP 异常: {e}")
             return None
 
+    def _recreate_session(self):
+        """重建会话，确保恢复链路使用全新 cookie 容器。"""
+        self.session = curl_requests.Session()
+        if self.proxy:
+            self.session.proxies = build_requests_proxy_config(self.proxy)
+
     def login_and_get_tokens(
         self,
         email,
@@ -728,6 +734,7 @@ class OAuthClient:
         prefer_passwordless_login=False,
         allow_phone_verification=True,
         login_source="",
+        _recovery_depth=0,
     ):
         """
         完整的 OAuth 登录流程，获取 tokens
@@ -914,24 +921,52 @@ class OAuthClient:
 
             if self._state_is_add_phone(state):
                 if not allow_phone_verification:
-                    self._set_error(
-                        "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                    if self._state_supports_workspace_resolution(state):
+                        self._log(
+                            "步骤5: add_phone 命中，但检测到 workspace 线索，继续尝试 workspace/org 选择"
+                        )
+                    elif prefer_passwordless_login and _recovery_depth < 1:
+                        self._log(
+                            "步骤5: add_phone 仍无 workspace/callback，重启一次全新 OAuth session + 新 PKCE"
+                        )
+                        self._recreate_session()
+                        return self.login_and_get_tokens(
+                            email,
+                            password,
+                            device_id,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            impersonate=impersonate,
+                            skymail_client=skymail_client,
+                            prefer_passwordless_login=prefer_passwordless_login,
+                            allow_phone_verification=allow_phone_verification,
+                            login_source=(
+                                f"{login_source}:add_phone_recovery"
+                                if login_source
+                                else "add_phone_recovery"
+                            ),
+                            _recovery_depth=_recovery_depth + 1,
+                        )
+                    else:
+                        self._set_error(
+                            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                        )
+                        return None
+                else:
+                    next_state = self._handle_add_phone_verification(
+                        device_id,
+                        user_agent,
+                        sec_ch_ua,
+                        impersonate,
+                        state,
                     )
-                    return None
-                next_state = self._handle_add_phone_verification(
-                    device_id,
-                    user_agent,
-                    sec_ch_ua,
-                    impersonate,
-                    state,
-                )
-                if not next_state:
-                    if not self.last_error:
-                        self._set_error("手机号验证后未进入下一步 OAuth 状态")
-                    return None
-                referer = state.current_url or referer
-                state = next_state
-                continue
+                    if not next_state:
+                        if not self.last_error:
+                            self._set_error("手机号验证后未进入下一步 OAuth 状态")
+                        return None
+                    referer = state.current_url or referer
+                    state = next_state
+                    continue
 
             if self._state_requires_navigation(state):
                 code, next_state = self._follow_flow_state(
@@ -958,10 +993,18 @@ class OAuthClient:
 
             if self._state_supports_workspace_resolution(state):
                 self._log("步骤6: 执行 workspace/org 选择")
-                code, next_state = self._oauth_submit_workspace_and_org(
+                consent_entry = (
                     state.continue_url
                     or state.current_url
-                    or f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent",
+                    or f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+                )
+                if self._state_is_add_phone(state):
+                    consent_entry = (
+                        f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+                    )
+                    self._log("步骤6: 当前处于 add_phone，改用 canonical consent URL 继续")
+                code, next_state = self._oauth_submit_workspace_and_org(
+                    consent_entry,
                     device_id,
                     user_agent,
                     impersonate,

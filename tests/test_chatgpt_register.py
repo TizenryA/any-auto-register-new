@@ -295,6 +295,61 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         follow_state.assert_called_once()
         handle_phone.assert_not_called()
 
+    def test_login_and_get_tokens_uses_canonical_consent_url_when_state_is_add_phone(self):
+        client = self._make_client()
+        add_phone_state = FlowState(
+            page_type="add_phone",
+            continue_url="https://auth.openai.com/add-phone",
+            current_url="https://auth.openai.com/add-phone",
+        )
+
+        with mock.patch.object(client, "_bootstrap_oauth_session", return_value="https://auth.openai.com/log-in"), \
+            mock.patch.object(client, "_submit_authorize_continue", return_value=add_phone_state), \
+            mock.patch.object(client, "_state_supports_workspace_resolution", return_value=True), \
+            mock.patch.object(client, "_state_requires_navigation", return_value=False), \
+            mock.patch.object(client, "_oauth_submit_workspace_and_org", return_value=("auth-code", None)) as submit_workspace, \
+            mock.patch.object(client, "_exchange_code_for_tokens", return_value={"access_token": "at"}):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                prefer_passwordless_login=True,
+                allow_phone_verification=False,
+                skymail_client=mock.Mock(),
+            )
+
+        self.assertEqual(tokens["access_token"], "at")
+        self.assertEqual(
+            submit_workspace.call_args.args[0],
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+    def test_login_and_get_tokens_retries_once_when_add_phone_has_no_workspace(self):
+        client = self._make_client()
+        add_phone_state = FlowState(
+            page_type="add_phone",
+            continue_url="https://auth.openai.com/add-phone",
+            current_url="https://auth.openai.com/add-phone",
+        )
+
+        with mock.patch.object(client, "_bootstrap_oauth_session", return_value="https://auth.openai.com/log-in") as bootstrap, \
+            mock.patch.object(client, "_submit_authorize_continue", return_value=add_phone_state) as submit_continue, \
+            mock.patch.object(client, "_state_supports_workspace_resolution", return_value=False), \
+            mock.patch.object(client, "_state_requires_navigation", return_value=False):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                prefer_passwordless_login=True,
+                allow_phone_verification=False,
+                skymail_client=mock.Mock(),
+            )
+
+        self.assertIsNone(tokens)
+        self.assertEqual(bootstrap.call_count, 2)
+        self.assertEqual(submit_continue.call_count, 2)
+        self.assertIn("未获取到 workspace / callback", client.last_error)
+
     def test_send_passwordless_login_otp_does_not_send_email_field(self):
         client = self._make_client()
         response = mock.Mock()
